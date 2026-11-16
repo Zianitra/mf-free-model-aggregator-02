@@ -3,7 +3,6 @@
 """Free-model aggregator: OpenAI/Anthropic-compatible proxy over OpenRouter free models."""
 import json
 import os
-import random
 import threading
 import time
 import urllib.error
@@ -59,21 +58,25 @@ class Router:
 
     def __init__(self, models, seed=JITTER_SEED):
         self.models = models
+        self.seed = seed
         self._lock = threading.Lock()
         self._fail_counts = {}   # model -> consecutive failures
+        self._success_streak = {}  # model -> consecutive successes
         self._cooldown_until = {}  # model -> monotonic time until which it is cooling down
-        self._rng = random.Random(seed)
 
     def jitter_for(self, model):
-        """Deterministic per-request jitter derived from the model name."""
-        h = self._rng  # keep rng deterministic per Router instance ordering
-        # stable hash without PYTHONHASHSEED dependence
-        val = 0
+        """Deterministic per-model jitter in [-JITTER_MILLI, +JITTER_MILLI], seeded."""
+        val = self.seed & 0xFFFFFFFF
         for ch in model:
             val = (val * 1000003 + ord(ch)) & 0xFFFFFFFF
-        jitter = (val % (2 * JITTER_MILLI + 1)) - JITTER_MILLI
-        h.random()  # advance rng deterministically
-        return jitter
+        val ^= val >> 13
+        val = (val * 2654435761) & 0xFFFFFFFF
+        return (val % (2 * JITTER_MILLI + 1)) - JITTER_MILLI
+
+    def health_bonus(self, model):
+        """Small deterministic bonus for models with a live success streak."""
+        streak = self._success_streak.get(model, 0)
+        return min(streak, 3) * 2.0
 
     def score(self, m, needs, now=None):
         """Score a candidate; higher is better. Excludes cooldowns and unmet capabilities."""
@@ -86,7 +89,7 @@ class Router:
             now = time.monotonic()
         if self._cooldown_until.get(m["model"], 0.0) > now:
             return None
-        return 0.6 * m["rating_milli"] + self.jitter_for(m["model"])
+        return 0.6 * m["rating_milli"] + self.jitter_for(m["model"]) + self.health_bonus(m["model"])
 
     def rank(self, needs=None, now=None):
         """Return candidate models sorted best-first, satisfying needs and health."""
@@ -102,6 +105,7 @@ class Router:
 
     def record_failure(self, model):
         with self._lock:
+            self._success_streak.pop(model, None)
             n = self._fail_counts.get(model, 0) + 1
             self._fail_counts[model] = n
             cd = min(FAIL_BASE_COOLDOWN * (2 ** (n - 1)), FAIL_MAX_COOLDOWN)
@@ -111,6 +115,7 @@ class Router:
     def record_success(self, model):
         with self._lock:
             self._fail_counts[model] = 0
+            self._success_streak[model] = self._success_streak.get(model, 0) + 1
             self._cooldown_until.pop(model, None)
 
 
@@ -312,12 +317,28 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": {"message": "not found"}})
 
+    def _chunk_write(self, text):
+        data = text.encode("utf-8")
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+
+    def _sse(self, obj, event=None):
+        body = ""
+        if event:
+            body += "event: %s\n" % event
+        body += "data: %s\n\n" % json.dumps(obj)
+        self._chunk_write(body)
+
+    def _end_stream(self):
+        self.wfile.write(b"0\r\n\r\n")
+
     # ---- request routing with failover ----
 
     def _route_and_call(self, payload, needs, stream, sink):
         """Try models best-first; on upstream failure record cooldown and failover.
         sink(chunk_dict, model) is called per SSE chunk / with the final response."""
         candidates = self.router.rank(needs)
+        if not candidates:
+            raise RuntimeError("no healthy model satisfies requirements: %s" % (needs or "none"))
         last_err = None
         for m in candidates:
             try:
@@ -325,17 +346,19 @@ class Handler(BaseHTTPRequestHandler):
                     buf = ""
                     for raw in upstream_stream(m["upstream"], payload):
                         buf += raw
-                        for line in buf.split("\n"):
-                            if line.startswith("data:"):
-                                data = line[5:].strip()
-                                if not data:
-                                    continue
-                                try:
-                                    chunk = json.loads(data)
-                                except ValueError:
-                                    continue
-                                sink(chunk, m["model"])
-                        buf = ""
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip("\r")
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if not data or data == "[DONE]":
+                                continue
+                            try:
+                                chunk = json.loads(data)
+                            except ValueError:
+                                continue
+                            sink(chunk, m["model"])
                     self.router.record_success(m["model"])
                     return m["model"]
                 else:
@@ -381,10 +404,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             def sink(chunk, model):
                 chunk["model"] = model
-                data = json.dumps(chunk).encode("utf-8")
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                self._sse(chunk)
             self._route_and_call(convert_openai_to_upstream(payload), needs, True, sink)
-            self.wfile.write(b"0\r\n\r\n")
+            self._end_stream()
         except (RuntimeError, BrokenPipeError) as e:
             data = json.dumps({"error": {"message": str(e)}}).encode("utf-8")
             self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(data), data))
@@ -413,9 +435,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         state = {"started": False, "model": "", "out_tokens": 0, "open_block": None}
         def emit(event, data):
-            data = json.dumps(data).encode("utf-8")
-            self.wfile.write(b"event: %s\r\n" % event.encode())
-            self.wfile.write(b"%x\r\n%s\r\n" % (len(data) + len(b"data: ") + 2, b"data: " + data + b"\r\n"))
+            self._sse(data, event=event)
         def sink(chunk, model):
             state["model"] = model
             if not state["started"]:
