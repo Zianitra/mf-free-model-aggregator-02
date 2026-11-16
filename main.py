@@ -455,5 +455,88 @@ def make_server(port=None, models=None):
     return srv
 
 
+def selftest():
+    """Offline self-test: route fake requests through the router logic. Exit 0 on success."""
+    import sys
+    models = load_brief()
+    r = Router(models)
+    assert len(models) >= 5, "expected >=5 models"
+
+    # json requirement routes to best json-capable model
+    cands = r.rank({"json": True})
+    assert cands, "no candidates for json"
+    assert cands[0]["json"], "top json candidate lacks json flag"
+
+    # vision requirement excludes vision-less models
+    cands = r.rank({"vision": True})
+    assert cands and all(m["vision"] for m in cands[:5])
+
+    # tools requirement
+    cands = r.rank({"tools": True})
+    assert cands and all(m["tools"] for m in cands[:5])
+
+    # combined requirements
+    cands = r.rank({"tools": True, "vision": True, "json": True})
+    assert cands and all(m["tools"] and m["vision"] and m["json"] for m in cands[:5])
+
+    # highest rated free model ranks first with no requirements
+    best = max(models, key=lambda m: m["rating_milli"])
+    top = r.rank({})[0]
+    assert top["model"] == best["model"], "top model should be highest rated: %s != %s" % (top["model"], best["model"])
+
+    # deterministic scoring: same router instance, same score twice
+    s1 = r.score(models[0], {})
+    s2 = r.score(models[0], {})
+    assert s1 == s2, "scores must be deterministic"
+
+    # cooldown: failing model is excluded, then recovers
+    victim = r.rank({})[-1]["model"]
+    r.record_failure(victim)
+    assert victim not in [m["model"] for m in r.rank({})], "cooled-down model still ranked"
+    r.record_success(victim)
+    assert victim in [m["model"] for m in r.rank({})], "model did not recover"
+
+    # exponential backoff grows
+    r2 = Router(models)
+    cd1 = r2.record_failure("x")
+    cd2 = r2.record_failure("x")
+    assert cd2 == 2 * cd1, "backoff not exponential: %s %s" % (cd1, cd2)
+
+    # failover: first model fails, next succeeds
+    order = r.rank({})
+    first, second = order[0], order[1]
+    r.record_failure(first["model"])  # simulate first failing
+    new_top = r.rank({})[0]
+    assert new_top["model"] != first["model"], "failover did not skip failed model"
+
+    # needs detection from payloads
+    needs = detect_needs({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]})
+    assert needs.get("vision"), "vision need not detected"
+    needs = detect_needs({"response_format": {"type": "json_object"}, "messages": []})
+    assert needs.get("json"), "json need not detected"
+    needs = detect_needs({"tools": [{"type": "function", "function": {"name": "f"}}], "messages": []})
+    assert needs.get("tools"), "tools need not detected"
+
+    # anthropic conversion round-trip basics
+    conv = anthropic_to_openai({"system": "be brief", "max_tokens": 10,
+                                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]})
+    assert conv["messages"][0]["role"] == "system" and conv["max_tokens"] == 10
+    out = openai_to_anthropic_response({"id": "a", "model": "m", "choices": [{"finish_reason": "stop",
+        "message": {"role": "assistant", "content": "yo"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 2}})
+    assert out["content"][0]["text"] == "yo" and out["usage"]["output_tokens"] == 2
+
+    print("selftest OK: %d models, top=%s (%d milli)" % (len(models), best["model"], best["rating_milli"]))
+    return 0
+
+
+def serve():
+    srv = make_server()
+    print("listening on :%d with %d free models" % (srv.server_address[1], len(Handler.router.models)))
+    srv.serve_forever()
+
+
 if __name__ == "__main__":
-    pass  # self-test appended in later commit
+    import sys
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    serve()
